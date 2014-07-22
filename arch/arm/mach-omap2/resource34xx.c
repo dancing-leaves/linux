@@ -157,8 +157,15 @@ unsigned short get_opp_id(struct omap_opp *opp_freq_table,
 	struct omap_opp *prcm_config;
 	prcm_config = opp_freq_table;
 
-	if (prcm_config->rate <= freq)
+	/*
+	 * If the highest OPP has lower freq compared to other OPP's
+	 * in the table, than the logic fails here.
+	 * Fixing it with proper check ..
+	 */
+	if (prcm_config->rate == freq)
 		return prcm_config->opp_id; /* Return the Highest OPP */
+	else
+		prcm_config--;
 	for (; prcm_config->rate; prcm_config--)
 		if (prcm_config->rate < freq)
 			return (prcm_config+1)->opp_id;
@@ -322,9 +329,9 @@ static int program_opp(int res, struct omap_opp *opp, int target_level,
 	} else {
 		/* if use class 1.5, decide on which voltage to use */
 		target_v = (opp[target_level].sr_adjust_vsel) ?
-			opp[target_level].sr_adjust_vsel : target_v;
+			opp[target_level].sr_vsr_step_vsel : target_v;
 		current_v = (opp[current_level].sr_adjust_vsel) ?
-			opp[current_level].sr_adjust_vsel : current_v;
+			opp[current_level].sr_vsr_step_vsel : current_v;
 	}
 
 	for (i = 0; i < 2; i++) {
@@ -408,6 +415,16 @@ int set_opp(struct shared_resource *resp, u32 target_level)
 	int ind;
 
 	if (resp == vdd1_resp) {
+		/* Some drivers call set_opp(vdd1) early in their boot probe
+		 * functions. As cpufreq_register_driver() is placed in the
+		 * late_init section there is a race here. Set opp might
+		 * call cpufreq_notify_transition() while cpufreq_driver=NULL,
+		 * causing kernel panics. So check if cpufreq driver is
+		 * loaded. If not, deny the VDD1 OPP change.
+		 */
+		if (cpufreq_quick_get(0) == 0)
+			return -EBUSY;
+
 		if (target_level < VDD1_THRESHOLD)
 			resource_release("vdd2_opp", &vdd2_dev);
 

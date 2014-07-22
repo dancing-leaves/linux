@@ -62,15 +62,18 @@ static ssize_t sr_steps_show(struct kobject *kobj, struct kobj_attribute *attr,
 /* sysfs interface to control steps added for 1G OPP */
 static struct kobj_attribute sr_margin_steps_1g_attr =
 	__ATTR(sr_steps_1g, 0644, sr_steps_show, sr_steps_store);
+static struct kobj_attribute sr_margin_steps_1p3_attr =
+	__ATTR(sr_steps_1p3, 0644, sr_steps_show, sr_steps_store);
 
 /* sysfs interface to control steps added for OPP's less than 1G */
 static struct kobj_attribute sr_margin_steps_attr =
 	__ATTR(sr_steps, 0644, sr_steps_show, sr_steps_store);
 
-/* Default steps added for 1G volt is 5 */
-static int sr_margin_steps_1g = 5;
-/* Default steps added for less than 1G OPP's is 3 */
-static int sr_margin_steps = 3;
+static unsigned long sr_margin_steps_1p3 = 62500;
+/* Default steps added for 1G volt is 5 in uV */
+static unsigned long sr_margin_steps_1g = 62500;
+/* Default steps added for less than 1G OPP's is 3 in uV*/
+static unsigned long sr_margin_steps = 37500;
 
 struct omap_sr {
 	int		srid;
@@ -79,8 +82,13 @@ struct omap_sr {
 	struct clk	*clk;
 	u32		clk_length;
 	u32		req_opp_no;
-	u32		opp1_nvalue, opp2_nvalue, opp3_nvalue, opp4_nvalue;
-	u32		opp5_nvalue, opp6_nvalue;
+	u32		opp1_nvalue, opp2_nvalue, opp3_nvalue;
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
+	u32		opp5_nvalue, opp6_nvalue, opp4_nvalue;
+#endif
 	u32		senp_mod, senn_mod;
 	void __iomem	*srbase_addr;
 	void __iomem	*vpbase_addr;
@@ -90,7 +98,8 @@ struct omap_sr {
 static void sr_add_margin_steps(struct omap_sr *sr);
 
 /* store sr1_opp nValues read from efuse */
-static u32 sr1_opp[5];
+static u32 sr1_opp[6];
+static unsigned long sr1_opp_margin[6];
 
 #define SR_REGADDR(offs)	(sr->srbase_addr + offset)
 
@@ -271,7 +280,7 @@ static inline u16 get_dsp_opp(void)
 static inline u16 get_vdd1_opp(void)
 {
 	int vdd1_opp;
-	if (cpu_is_omap3630())
+	if (cpu_is_omap3630() && (!(cpu_is_omap3621())) )
 		/*
 		 * if vdd1 opp table has any two opp's same freq than
 		 * check the dsp opp instead
@@ -322,102 +331,33 @@ static void sr_set_clk_length(struct omap_sr *sr)
 
 static void sr_add_margin_steps(struct omap_sr *sr)
 {
-	u32 senn_adj = 3.0*12.5;
-	u32 senp_adj = 2.6*12.5;
+	int i;
 
-	if (sr->srid == SR1) {
-		if (sr_margin_steps_1g) {
-			sr->opp4_nvalue = calculate_opp_nvalue(sr->opp4_nvalue,
-						senn_adj*sr_margin_steps_1g,
-						senp_adj*sr_margin_steps_1g);
-		}
+	/*
+	 * Add 5 steps for 1g and 3 steps for other OPP's by default
+	 */
+	for (i = 1; i <= 3; i++)
+		sr1_opp_margin[i] = sr_margin_steps;
 
-		if (sr_margin_steps) {
-			sr->opp3_nvalue = calculate_opp_nvalue(sr1_opp[3],
-						senn_adj*sr_margin_steps,
-						senp_adj*sr_margin_steps);
-			sr->opp2_nvalue = calculate_opp_nvalue(sr1_opp[2],
-						senn_adj*sr_margin_steps,
-						senp_adj*sr_margin_steps);
-			sr->opp1_nvalue = calculate_opp_nvalue(sr1_opp[1],
-						senn_adj*sr_margin_steps,
-						senp_adj*sr_margin_steps);
-		}
+#ifdef CONFIG_MACH_OMAP3621_EVT1A
+	sr1_opp_margin[4] = sr_margin_steps_1g;
+	sr1_opp_margin[5] = sr_margin_steps_1p3;
+#endif
+#if defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER)
+	sr1_opp_margin[4] = sr_margin_steps_1g;
+	sr1_opp_margin[5] = sr_margin_steps_1p3;
+#endif
+
+	for (i = 1; i <= MAX_VDD1_OPP; i++) {
+		pr_info("sr1_opp_margin[%d]=%ld\n", i,
+					sr1_opp_margin[i]);
 	}
+	pr_info("steps added, volt will be"
+				"recaliberated automatically\n");
 
-}
-static void sr_set_efuse_nvalues(struct omap_sr *sr)
-{
-	if (sr->srid == SR1) {
-		if (cpu_is_omap3630()) {
-			sr->senn_mod = sr->senp_mod = 0x1;
-
-			sr->opp4_nvalue = sr1_opp[4] =
-			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP4_VDD1);
-			if (sr->opp4_nvalue != 0x0)
-				printk("SR1:Fused Nvalues for VDD1OPP4 %x\n",
-							sr->opp4_nvalue);
-			sr->opp5_nvalue = sr->opp4_nvalue;
-
-			sr->opp3_nvalue = sr1_opp[3] =
-			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP3_VDD1);
-			sr->opp2_nvalue = sr1_opp[2] =
-			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP2_VDD1);
-			sr->opp1_nvalue = sr1_opp[1] =
-			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP1_VDD1);
-
-			if (sr_margin_steps || sr_margin_steps_1g)
-				sr_add_margin_steps(sr);
-		} else {
-			sr->senn_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
-						OMAP343X_SR1_SENNENABLE_MASK) >>
-						OMAP343X_SR1_SENNENABLE_SHIFT;
-			sr->senp_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
-						OMAP343X_SR1_SENPENABLE_MASK) >>
-						OMAP343X_SR1_SENPENABLE_SHIFT;
-
-			sr->opp5_nvalue = omap_ctrl_readl(
-						OMAP343X_CONTROL_FUSE_OPP5_VDD1);
-			sr->opp4_nvalue = omap_ctrl_readl(
-						OMAP343X_CONTROL_FUSE_OPP4_VDD1);
-			sr->opp3_nvalue = omap_ctrl_readl(
-						OMAP343X_CONTROL_FUSE_OPP3_VDD1);
-			sr->opp2_nvalue = omap_ctrl_readl(
-						OMAP343X_CONTROL_FUSE_OPP2_VDD1);
-			sr->opp1_nvalue = omap_ctrl_readl(
-						OMAP343X_CONTROL_FUSE_OPP1_VDD1);
-			if (sr->opp5_nvalue) {
-				sr->opp6_nvalue = calculate_opp_nvalue(sr->opp5_nvalue,
-				227, 379);
-			}
-		}
-	} else if (sr->srid == SR2) {
-		if (cpu_is_omap3630()) {
-			sr->senn_mod = sr->senp_mod = 0x1;
-			sr->opp1_nvalue =
-			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP1_VDD2);
-			if (sr->opp1_nvalue != 0)
-				printk("SR2:Fused Nvalues for VDD2OPP1 %d\n",
-							sr->opp1_nvalue);
-			sr->opp2_nvalue =
-			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP2_VDD2);
-		} else {
-			sr->senn_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
-					OMAP343X_SR2_SENNENABLE_MASK) >>
-					OMAP343X_SR2_SENNENABLE_SHIFT;
-
-			sr->senp_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
-					OMAP343X_SR2_SENPENABLE_MASK) >>
-					OMAP343X_SR2_SENPENABLE_SHIFT;
-
-			sr->opp3_nvalue = omap_ctrl_readl(
-					OMAP343X_CONTROL_FUSE_OPP3_VDD2);
-			sr->opp2_nvalue = omap_ctrl_readl(
-					OMAP343X_CONTROL_FUSE_OPP2_VDD2);
-			sr->opp1_nvalue = omap_ctrl_readl(
-					OMAP343X_CONTROL_FUSE_OPP1_VDD2);
-		}
-	}
 }
 
 /* Hard coded nvalues for testing purposes, may cause device to hang! */
@@ -432,16 +372,21 @@ static void sr_set_testing_nvalues(struct omap_sr *sr)
 			sr->opp1_nvalue = cal_test_nvalue(581, 489);
 			sr->opp2_nvalue = cal_test_nvalue(1072, 910);
 			sr->opp3_nvalue = cal_test_nvalue(1405, 1200);
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
 			sr->opp4_nvalue = cal_test_nvalue(1842, 1580);
-			/*
-			 * use delta adjustment algorithm to add 80 mV to
-			 * OPP4 test n value.
-			 * It is seen that with 1G volt drops when SR is
-			 * enabled.
-			 */
-			sr->opp4_nvalue = calculate_opp_nvalue(sr->opp4_nvalue, 240, 160);
 			sr->opp5_nvalue = cal_test_nvalue(1842, 1580);
-		} else {
+#endif
+			if (sr_margin_steps || sr_margin_steps_1g)
+				sr_add_margin_steps(sr);
+		}
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
+		else {
 		sr->senp_mod = 0x03;	/* SenN-M5 enabled */
 		sr->senn_mod = 0x03;
 
@@ -455,12 +400,13 @@ static void sr_set_testing_nvalues(struct omap_sr *sr)
 			sr->opp4_nvalue = cal_test_nvalue(0x964 + 0x2a0,
 							0x727 + 0x2a0);
 			sr->opp5_nvalue = cal_test_nvalue(0xacd + 0x330,
-							0x848 + 0x330);
+			                                0x848 + 0x330);		
 		}
 		if (sr->opp5_nvalue) {
 			sr->opp6_nvalue = calculate_opp_nvalue(sr->opp5_nvalue,
 			227, 379);
 		}
+#endif
 	} else if (sr->srid == SR2) {
 		if (cpu_is_omap3630()) {
 			sr->senp_mod = 0x1;
@@ -482,6 +428,191 @@ static void sr_set_testing_nvalues(struct omap_sr *sr)
 
 	}
 
+}
+
+u32 sr_read_efuse_nvalues(int opp_no)
+{
+	switch (opp_no) {
+		case VDD1_OPP1:
+			return omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP1_VDD1);
+		case VDD1_OPP2:
+			return omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP2_VDD1);
+		case VDD1_OPP3:
+			return omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP3_VDD1);
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
+		case VDD1_OPP4:
+			return omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP4_VDD1);
+		case VDD1_OPP5:
+			return omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP5_VDD1);
+#endif
+		default:
+			pr_err("In valid sr1 opp no\n");
+			return 0;
+	}
+}
+EXPORT_SYMBOL(sr_read_efuse_nvalues);
+
+static void sr_set_efuse_nvalues(struct omap_sr *sr)
+{
+	u32 senn_adj = 3.0*12.5;
+	u32 senp_adj = 2.6*12.5;
+
+	if (sr->srid == SR1) {
+		if (cpu_is_omap3630()) {
+			sr->senn_mod = sr->senp_mod = 0x1;
+
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
+			sr->opp5_nvalue = sr1_opp[5] =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP5_VDD1);
+			if (sr->opp5_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD1OPP5 %x\n",
+							sr->opp5_nvalue);
+			} else {
+				pr_info(KERN_INFO "SR: Nvalues not fused for"
+							"1.2G, disabled\n");
+			}
+
+			sr->opp4_nvalue = sr1_opp[4] =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP4_VDD1);
+
+			if (sr->opp4_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD1OPP4 %x\n",
+							sr->opp4_nvalue);
+			} else {
+				pr_info(KERN_INFO "SR: using test nvalues\n");
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+			sr->opp5_nvalue = sr->opp4_nvalue;
+#endif
+
+			sr->opp3_nvalue = sr1_opp[3] =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP3_VDD1);
+			if (sr->opp3_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD1OPP3 %x\n",
+							sr->opp3_nvalue);
+			} else {
+				pr_info(KERN_INFO "SR: using test nvalues\n");
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+			sr->opp2_nvalue = sr1_opp[2] =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP2_VDD1);
+			if (sr->opp2_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD1OPP2 %x\n",
+							sr->opp2_nvalue);
+			} else {
+				pr_info(KERN_INFO "SR: using test nvalues\n");
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+
+			sr->opp1_nvalue = sr1_opp[1] =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP1_VDD1);
+			if (sr->opp1_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD1OPP1 %x\n",
+							sr->opp1_nvalue);
+			} else {
+				pr_info(KERN_INFO "SR: using test nvalues\n");
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+
+			if (sr_margin_steps || sr_margin_steps_1g)
+				sr_add_margin_steps(sr);
+		} else {
+			sr->senn_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
+						OMAP343X_SR1_SENNENABLE_MASK) >>
+						OMAP343X_SR1_SENNENABLE_SHIFT;
+			sr->senp_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
+						OMAP343X_SR1_SENPENABLE_MASK) >>
+						OMAP343X_SR1_SENPENABLE_SHIFT;
+
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
+			sr->opp5_nvalue = omap_ctrl_readl(
+						OMAP343X_CONTROL_FUSE_OPP5_VDD1);
+			if (sr->opp5_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD1OPP5 %x\n",
+							sr->opp5_nvalue);
+			} else {
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+			sr->opp4_nvalue = omap_ctrl_readl(
+						OMAP343X_CONTROL_FUSE_OPP4_VDD1);
+#endif
+
+			sr->opp3_nvalue = omap_ctrl_readl(
+						OMAP343X_CONTROL_FUSE_OPP3_VDD1);
+			sr->opp2_nvalue = omap_ctrl_readl(
+						OMAP343X_CONTROL_FUSE_OPP2_VDD1);
+			sr->opp1_nvalue = omap_ctrl_readl(
+						OMAP343X_CONTROL_FUSE_OPP1_VDD1);
+
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
+			if (sr->opp5_nvalue) {
+				sr->opp6_nvalue = calculate_opp_nvalue(sr->opp5_nvalue,
+				227, 379);
+			}
+#endif
+		}
+	} else if (sr->srid == SR2) {
+		if (cpu_is_omap3630()) {
+			sr->senn_mod = sr->senp_mod = 0x1;
+			sr->opp1_nvalue =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP1_VDD2);
+			if (sr->opp1_nvalue != 0) {
+				pr_info("SR2:Fused Nvalues for VDD2OPP1 %d\n",
+							sr->opp1_nvalue);
+			} else {
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+			sr->opp2_nvalue =
+			   omap_ctrl_readl(OMAP36XX_CONTROL_FUSE_OPP2_VDD2);
+		} else {
+			sr->senn_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
+					OMAP343X_SR2_SENNENABLE_MASK) >>
+					OMAP343X_SR2_SENNENABLE_SHIFT;
+
+			sr->senp_mod = (omap_ctrl_readl(OMAP343X_CONTROL_FUSE_SR) &
+					OMAP343X_SR2_SENPENABLE_MASK) >>
+					OMAP343X_SR2_SENPENABLE_SHIFT;
+
+			sr->opp3_nvalue = omap_ctrl_readl(
+					OMAP343X_CONTROL_FUSE_OPP3_VDD2);
+			sr->opp2_nvalue = omap_ctrl_readl(
+					OMAP343X_CONTROL_FUSE_OPP2_VDD2);
+			if (sr->opp2_nvalue != 0x0) {
+				pr_info("SR1:Fused Nvalues for VDD2OPP2 %x\n",
+							sr->opp2_nvalue);
+			} else {
+				/* use test nvalues */
+				sr_set_testing_nvalues(sr);
+				return;
+			}
+			sr->opp1_nvalue = omap_ctrl_readl(
+					OMAP343X_CONTROL_FUSE_OPP1_VDD2);
+		}
+	}
 }
 
 static void sr_set_nvalues(struct omap_sr *sr)
@@ -755,6 +886,17 @@ static inline void sr_udelay(u32 delay)
 
 }
 
+unsigned long omap_twl_vsel_to_uv(const u8 vsel)
+{
+	return (((vsel * 125) + 6000)) * 100;
+}
+
+u8 omap_twl_uv_to_vsel(unsigned long uv)
+{
+	/* Round up to higher voltage */
+	return (((uv + 99) / 100 - 6000) + 124) / 125;
+}
+
 #define SR_CLASS1P5_LOOP_US	100
 #define MAX_STABILIZATION_COUNT 100
 #define MAX_LOOP_COUNT		(MAX_STABILIZATION_COUNT * 20)
@@ -763,8 +905,10 @@ int sr_recalibrate(int srid, u32 t_opp, u32 c_opp)
 	u32 max_loop_count = MAX_LOOP_COUNT;
 	u32 exit_loop_on = 0;
 	u32 target_opp_no;
+	unsigned long v_step;
 	u8 new_v = 0;
 	u8 high_v = 0;
+	u8 vsel_step = 0;
 	struct omap_sr *sr;
 
 	if (srid == SR1)
@@ -821,10 +965,16 @@ int sr_recalibrate(int srid, u32 t_opp, u32 c_opp)
 	/* Stop Smart reflex */
 	disable_smartreflex(srid);
 
-	if (srid == SR1)
+	if (srid == SR1) {
 		mpu_opps[target_opp_no].sr_adjust_vsel = high_v;
-	else if (srid == SR2)
+		v_step = omap_twl_vsel_to_uv(high_v);
+		v_step += sr1_opp_margin[target_opp_no];
+		vsel_step = omap_twl_uv_to_vsel(v_step);
+		mpu_opps[target_opp_no].sr_vsr_step_vsel = vsel_step;
+	} else if (srid == SR2) {
 		l3_opps[target_opp_no].sr_adjust_vsel = high_v;
+		l3_opps[target_opp_no].sr_vsr_step_vsel = high_v;
+	}
 
 	pr_debug("Calibrate:Exit %s [vdd%d: opp%d] %02x loops=[%d,%d]\n",
 		__func__, srid, target_opp_no, high_v,
@@ -846,6 +996,10 @@ static int sr_enable(struct omap_sr *sr, u32 target_opp_no)
 
 	if (sr->srid == SR1) {
 		switch (target_opp_no) {
+#if !(defined(CONFIG_MACH_OMAP3621_BOXER) ||\
+	defined(CONFIG_MACH_OMAP3621_EVT1A) ||\
+	defined(CONFIG_MACH_OMAP3621_EDP) ||\
+	defined(CONFIG_MACH_OMAP3621_GOSSAMER))
 		case 6:
 			nvalue_reciprocal = sr->opp6_nvalue;
 			break;
@@ -855,6 +1009,7 @@ static int sr_enable(struct omap_sr *sr, u32 target_opp_no)
 		case 4:
 			nvalue_reciprocal = sr->opp4_nvalue;
 			break;
+#endif
 		case 3:
 			nvalue_reciprocal = sr->opp3_nvalue;
 			break;
@@ -1378,9 +1533,11 @@ static ssize_t sr_steps_store(struct kobject *kobj,
 	}
 
 	if (attr == &sr_margin_steps_1g_attr)
-		sr_margin_steps_1g = value;
+		sr_margin_steps_1g = 12500 * value;
 	else if (attr == &sr_margin_steps_attr)
-		sr_margin_steps = value;
+		sr_margin_steps = 12500 * value;
+	else if (attr == &sr_margin_steps_1p3_attr)
+		sr_margin_steps_1p3 = 12500 * value;
 	else
 		return -EINVAL;
 
@@ -1393,9 +1550,11 @@ static ssize_t sr_steps_show(struct kobject *kobj, struct kobj_attribute *attr,
 			 char *buf)
 {
 	if (attr == &sr_margin_steps_1g_attr)
-		return sprintf(buf, "%u\n", sr_margin_steps_1g);
+		return sprintf(buf, "%lu\n", sr_margin_steps_1g);
 	else if (attr == &sr_margin_steps_attr)
-		return sprintf(buf, "%u\n", sr_margin_steps);
+		return sprintf(buf, "%lu\n", sr_margin_steps);
+	else if (attr == &sr_margin_steps_1p3_attr)
+		return sprintf(buf, "%lu\n", sr_margin_steps_1p3);
 	else
 		return -EINVAL;
 }
@@ -1585,6 +1744,9 @@ static int __init omap3_sr_init(void)
 
 	pr_info("SmartReflex driver initialized\n");
 
+	ret = sysfs_create_file(power_kobj, &sr_margin_steps_1p3_attr.attr);
+	if (ret)
+		pr_err("sysfs_create_file failed: %d\n", ret);
 	ret = sysfs_create_file(power_kobj, &sr_margin_steps_1g_attr.attr);
 	if (ret)
 		pr_err("sysfs_create_file failed: %d\n", ret);

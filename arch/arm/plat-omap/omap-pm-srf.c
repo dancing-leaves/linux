@@ -33,6 +33,8 @@ struct omap_opp *dsp_opps;
 struct omap_opp *mpu_opps;
 struct omap_opp *l3_opps;
 
+extern u32 sr_read_efuse_nvalues(int opp_no);
+
 #define LAT_RES_POSTAMBLE "_latency"
 #define MAX_LATENCY_RES_NAME 30
 
@@ -171,8 +173,6 @@ void omap_pm_set_max_sdma_lat(struct device *dev, long t)
 	}
 }
 
-static struct device dummy_dsp_dev;
-
 /*
  * DSP Bridge-specific constraints
  */
@@ -189,7 +189,6 @@ const struct omap_opp *omap_pm_dsp_get_opp_table(void)
 }
 EXPORT_SYMBOL(omap_pm_dsp_get_opp_table);
 
-static struct device dummy_vdd1_dev;
 void omap_pm_vdd1_set_max_opp(struct device *dev, u8 opp_id)
 {
 	pr_debug("OMAP PM: requests constraint for max OPP ID\n");
@@ -201,6 +200,7 @@ void omap_pm_vdd1_set_max_opp(struct device *dev, u8 opp_id)
 }
 EXPORT_SYMBOL(omap_pm_vdd1_set_max_opp);
 
+static bool vdd1_max_opp;
 void omap_pm_dsp_set_min_opp(struct device *dev, unsigned long f)
 {
 	u8 opp_id;
@@ -211,6 +211,29 @@ void omap_pm_dsp_set_min_opp(struct device *dev, unsigned long f)
 	};
 
 	pr_debug("OMAP PM: DSP requests minimum VDD1 OPP to be %d\n", opp_id);
+
+	if (cpu_is_omap3630()) {
+		/*
+		 * check if OPP requested is 65Mz or greater if yes set
+		 * max opp constraint to OPP4, Which limits scaling of VDD1
+		 * OPP to 1G only. 1.3G will be allowed when DSP load dies
+		 * down to 65MHz.
+		 */
+		if ((f > S65M) && !vdd1_max_opp) {
+			vdd1_max_opp = 1;
+			omap_pm_vdd1_set_max_opp(dev, VDD1_OPP4);
+		} else if ((f < S260M) && vdd1_max_opp) {
+			omap_pm_vdd1_set_max_opp(dev, 0);
+			vdd1_max_opp = 0;
+		}
+
+		/*
+		 * DSP table has 65MHz as OPP5, give OPP1-260MHz when DSP request
+		 * 65MHz-OPP1
+		 */
+		if (f == S65M)
+			f = S260M;
+	}
 
 	opp_id = get_opp_id(dsp_opps + MAX_VDD1_OPP, f);
 
@@ -388,11 +411,19 @@ void omap_pm_if_exit(void)
 
 u8 omap_pm_get_max_vdd1_opp()
 {
-	if (cpu_is_omap3630()) {
+
+if (cpu_is_omap3622()) {
+		return VDD1_OPP4;
+	} else if (cpu_is_omap3621())
+    return VDD1_OPP3;
+	else if (cpu_is_omap3630()) {
 		switch (omap_rev_id()) {
 		case OMAP_3630:
 		default:
-			return VDD1_OPP4;
+			if (sr_read_efuse_nvalues(VDD1_OPP5) != 0)
+				return VDD1_OPP5;
+			else
+				return VDD1_OPP4;
 		case OMAP_3630_800:
 			return VDD1_OPP3;
 		case OMAP_3630_1000:
