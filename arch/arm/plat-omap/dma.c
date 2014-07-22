@@ -49,7 +49,15 @@ enum { DMA_CHAIN_STARTED, DMA_CHAIN_NOTSTARTED };
 
 #define OMAP_FUNC_MUX_ARM_BASE		(0xfffe1000 + 0xec)
 
+#define OMAP_DMA_RW_ACTIVE	 (0x03 << 9)
+
 static int enable_1510_mode;
+
+static struct omap_dma_global_context_registers {
+	u32 dma_irqenable_l0;
+	u32 dma_ocp_sysconfig;
+	u32 dma_gcr;
+} omap_dma_global_context;
 
 struct omap_dma_lch {
 	int next_lch;
@@ -123,6 +131,7 @@ static struct dma_link_info *dma_linked_lch;
 
 static int dma_lch_count;
 static int dma_chan_count;
+static int omap_dma_reserve_channels;
 
 static spinlock_t dma_chan_lock;
 static struct omap_dma_lch *dma_chan;
@@ -258,6 +267,12 @@ void omap_set_dma_transfer_params(int lch, int data_type, int elem_count,
 	l |= data_type;
 	dma_write(l, CSDP(lch));
 
+	/* Enable SRC and DEST pack and burst by default */
+	omap_set_dma_src_data_pack(lch, 1);
+	omap_set_dma_src_burst_mode(lch, OMAP_DMA_DATA_BURST_16);
+	omap_set_dma_dest_data_pack(lch, 1);
+	omap_set_dma_dest_burst_mode(lch, OMAP_DMA_DATA_BURST_16);
+
 	if (cpu_class_is_omap1()) {
 		u16 ccr;
 
@@ -284,12 +299,14 @@ void omap_set_dma_transfer_params(int lch, int data_type, int elem_count,
 		val |= (dma_trigger & ~0x1f) << 14;
 		val |= dma_trigger & 0x1f;
 
-		if (sync_mode & OMAP_DMA_SYNC_FRAME)
+		if ((sync_mode == OMAP_DMA_SYNC_FRAME) ||
+		    (sync_mode == OMAP_DMA_SYNC_PACKET))
 			val |= 1 << 5;
 		else
 			val &= ~(1 << 5);
 
-		if (sync_mode & OMAP_DMA_SYNC_BLOCK)
+		if ((sync_mode == OMAP_DMA_SYNC_BLOCK) ||
+		    (sync_mode == OMAP_DMA_SYNC_PACKET))
 			val |= 1 << 18;
 		else
 			val &= ~(1 << 18);
@@ -309,14 +326,10 @@ EXPORT_SYMBOL(omap_set_dma_transfer_params);
 
 void omap_set_dma_color_mode(int lch, enum omap_dma_color_mode mode, u32 color)
 {
-	u16 w;
-
 	BUG_ON(omap_dma_in_1510_mode());
 
-	if (cpu_class_is_omap2()) {
-		REVISIT_24XX();
-		return;
-	}
+	if (cpu_class_is_omap1()) {
+		u16 w;
 
 	w = dma_read(CCR2(lch));
 	w &= ~0x03;
@@ -344,6 +357,31 @@ void omap_set_dma_color_mode(int lch, enum omap_dma_color_mode mode, u32 color)
 		w |= 1;		/* Channel type G */
 	}
 	dma_write(w, LCH_CTRL(lch));
+	}
+
+	if (cpu_class_is_omap2()) {
+		u32 val;
+
+		val = dma_read(CCR(lch));
+		val &= ~((1 << 17) | (1 << 16));
+
+		switch (mode) {
+		case OMAP_DMA_CONSTANT_FILL:
+			val |= 1 << 16;
+			break;
+		case OMAP_DMA_TRANSPARENT_COPY:
+			val |= 1 << 17;
+			break;
+		case OMAP_DMA_COLOR_DIS:
+			break;
+		default:
+			BUG();
+		}
+		dma_write(val, CCR(lch));
+
+		color &= 0xffffff;
+		dma_write(color, COLOR(lch));
+	}
 }
 EXPORT_SYMBOL(omap_set_dma_color_mode);
 
@@ -447,6 +485,35 @@ void omap_set_dma_src_data_pack(int lch, int enable)
 	dma_write(l, CSDP(lch));
 }
 EXPORT_SYMBOL(omap_set_dma_src_data_pack);
+
+/**
+ * @brief omap_set_dma_prefetch : Enable/disable prefetch
+ * for a logical channel
+ *
+ * @param lch : Logical channel number
+ * @param enable : 1 to enable / 0 to disable
+ *
+ * Prefetch can only be enabled for destination synchronized transfer.
+ * It is SW user responsibility to have prefetch disabled for source
+ * synchronized transfers.
+ * It improves DMA performance by fetching data before receiving
+ * the DMA request. Therefore, the data source shall be available when
+ * the logical channel is enabled.
+ *
+ */
+void omap_set_dma_prefetch(int lch, int enable)
+{
+	u32 l;
+
+	if (cpu_class_is_omap2()) {
+		l = dma_read(CCR(lch));
+		l &= ~(1 << 23);
+		if (enable)
+			l |= (1 << 23);
+		dma_write(l, CCR(lch));
+	}
+}
+EXPORT_SYMBOL(omap_set_dma_prefetch);
 
 void omap_set_dma_src_burst_mode(int lch, enum omap_dma_burst_mode burst_mode)
 {
@@ -793,7 +860,10 @@ void omap_free_dma(int lch)
 		/* Disable all DMA interrupts for the channel. */
 		dma_write(0, CICR(lch));
 
-		/* Make sure the DMA transfer is stopped. */
+		/*
+		 * Make sure the DMA transfer is stopped
+		 * and disable prefetch.
+		 */
 		dma_write(0, CCR(lch));
 		omap_clear_dma(lch);
 	}
@@ -922,7 +992,9 @@ void omap_start_dma(int lch)
 
 			cur_lch = next_lch;
 		} while (next_lch != -1);
-	} else if (cpu_class_is_omap2()) {
+	} else if (cpu_is_omap242x() ||
+		(cpu_is_omap243x() &&  omap_type() <= OMAP2430_REV_ES1_0)) {
+
 		/* Errata: Need to write lch even if not using chaining */
 		dma_write(lch, CLNK_CTRL(lch));
 	}
@@ -981,6 +1053,15 @@ void omap_stop_dma(int lch)
 	dma_chan[lch].flags &= ~OMAP_DMA_ACTIVE;
 }
 EXPORT_SYMBOL(omap_stop_dma);
+
+void omap_disable_lch(int lch)
+{
+	u32 l;
+	l = dma_read(CCR(lch));
+	l &= ~OMAP_DMA_CCR_EN;
+	dma_write(l, CCR(lch));
+}
+EXPORT_SYMBOL(omap_disable_lch);
 
 /*
  * Allows changing the DMA callback function or data. This may be needed if
@@ -1076,6 +1157,15 @@ int omap_get_dma_active_status(int lch)
 	return (dma_read(CCR(lch)) & OMAP_DMA_CCR_EN) != 0;
 }
 EXPORT_SYMBOL(omap_get_dma_active_status);
+
+int omap_get_dma_rd_wr_active_status(int lch)
+{
+	u32		ccr;
+
+	ccr = dma_read(CCR(lch));
+	return (ccr & OMAP_DMA_RW_ACTIVE);
+}
+EXPORT_SYMBOL(omap_get_dma_rd_wr_active_status);
 
 int omap_dma_running(void)
 {
@@ -1900,7 +1990,7 @@ static int omap2_dma_handle_ch(int ch)
 /* STATUS register count is from 1-32 while our is 0-31 */
 static irqreturn_t omap2_dma_irq_handler(int irq, void *dev_id)
 {
-	u32 val;
+	u32 val, enable_reg;
 	int i;
 
 	val = dma_read(IRQSTATUS_L0);
@@ -1909,6 +1999,8 @@ static irqreturn_t omap2_dma_irq_handler(int irq, void *dev_id)
 			printk(KERN_WARNING "Spurious DMA IRQ\n");
 		return IRQ_HANDLED;
 	}
+	enable_reg = dma_read(IRQENABLE_L0);
+	val &= enable_reg; /* Dispatch only relevant interrupts */
 	for (i = 0; i < dma_lch_count && val != 0; i++) {
 		if (val & 1)
 			omap2_dma_handle_ch(i);
@@ -2301,6 +2393,53 @@ void omap_stop_lcd_dma(void)
 }
 EXPORT_SYMBOL(omap_stop_lcd_dma);
 
+void omap_dma_global_context_save(void)
+{
+	omap_dma_global_context.dma_irqenable_l0 =
+		dma_read(IRQENABLE_L0);
+	omap_dma_global_context.dma_ocp_sysconfig =
+		dma_read(OCP_SYSCONFIG);
+	omap_dma_global_context.dma_gcr = dma_read(GCR);
+}
+EXPORT_SYMBOL(omap_dma_global_context_save);
+
+void omap_dma_global_context_restore(void)
+{
+	int ch;
+
+	dma_write(omap_dma_global_context.dma_gcr, GCR);
+	dma_write(omap_dma_global_context.dma_ocp_sysconfig,
+		OCP_SYSCONFIG);
+	dma_write(omap_dma_global_context.dma_irqenable_l0,
+		IRQENABLE_L0);
+
+	/*
+	 * A bug in ROM code leaves IRQ status for channels 0 and 1 uncleared
+	 * after secure sram context save and restore. Hence we need to
+	 * manually clear those IRQs to avoid spurious interrupts. This
+	 * affects only secure devices.
+	 */
+	if (cpu_is_omap34xx() && (omap_type() != OMAP2_DEVICE_TYPE_GP))
+		dma_write(0x3 , IRQSTATUS_L0);
+
+	for (ch = 0; ch < dma_chan_count; ch++)
+		if (dma_chan[ch].dev_id != -1)
+			omap_clear_dma(ch);
+}
+EXPORT_SYMBOL(omap_dma_global_context_restore);
+
+void omap_dma_disable_irq(int lch)
+{
+	u32 val;
+
+	if (cpu_class_is_omap2()) {
+		/* Disable interrupts */
+		val = dma_read(IRQENABLE_L0);
+		val &= ~(1 << lch);
+		dma_write(val, IRQENABLE_L0);
+	}
+}
+
 /*----------------------------------------------------------------------------*/
 
 static int __init omap_init_dma(void)
@@ -2320,6 +2459,10 @@ static int __init omap_init_dma(void)
 		pr_err("DMA init failed for unsupported omap\n");
 		return -ENODEV;
 	}
+
+	if (cpu_class_is_omap2() && omap_dma_reserve_channels
+			&& (omap_dma_reserve_channels <= dma_lch_count))
+		dma_lch_count = omap_dma_reserve_channels;
 
 	dma_chan = kzalloc(sizeof(struct omap_dma_lch) * dma_lch_count,
 				GFP_KERNEL);
@@ -2371,7 +2514,7 @@ static int __init omap_init_dma(void)
 		u8 revision = dma_read(REVISION) & 0xff;
 		printk(KERN_INFO "OMAP DMA hardware revision %d.%d\n",
 		       revision >> 4, revision & 0xf);
-		dma_chan_count = OMAP_DMA4_LOGICAL_DMA_CH_COUNT;
+		dma_chan_count = dma_lch_count;
 	} else {
 		dma_chan_count = 0;
 		return 0;
@@ -2417,6 +2560,26 @@ static int __init omap_init_dma(void)
 	if (cpu_class_is_omap2())
 		setup_irq(INT_24XX_SDMA_IRQ0, &omap24xx_dma_irq);
 
+	if (cpu_is_omap34xx()) {
+		/* Enable smartidle idlemodes and autoidle */
+		u32 v = dma_read(OCP_SYSCONFIG);
+		v &= ~(DMA_SYSCONFIG_MIDLEMODE_MASK |
+				DMA_SYSCONFIG_SIDLEMODE_MASK |
+				DMA_SYSCONFIG_AUTOIDLE);
+		v |= (DMA_SYSCONFIG_MIDLEMODE(DMA_IDLEMODE_SMARTIDLE) |
+			DMA_SYSCONFIG_SIDLEMODE(DMA_IDLEMODE_SMARTIDLE) |
+			DMA_SYSCONFIG_AUTOIDLE);
+		dma_write(v , OCP_SYSCONFIG);
+		/* reserve dma channels 0 and 1 in high security devices */
+		if (omap_type() != OMAP2_DEVICE_TYPE_GP) {
+			printk(KERN_INFO "Reserving DMA channels 0 and 1 for "
+					"HS ROM code\n");
+			dma_chan[0].dev_id = 0;
+			dma_chan[1].dev_id = 1;
+		}
+	}
+
+
 	/* FIXME: Update LCD DMA to work on 24xx */
 	if (cpu_class_is_omap1()) {
 		r = request_irq(INT_DMA_LCD, lcd_dma_irq_handler, 0,
@@ -2436,5 +2599,18 @@ static int __init omap_init_dma(void)
 }
 
 arch_initcall(omap_init_dma);
+
+/*
+ * Reserve the omap SDMA channels using cmdline bootarg
+ * "omap_dma_reserve_ch=". The valid range is 1 to 32
+ */
+static int __init omap_dma_cmdline_reserve_ch(char *str)
+{
+	if (get_option(&str, &omap_dma_reserve_channels) != 1)
+		omap_dma_reserve_channels = 0;
+	return 1;
+}
+
+__setup("omap_dma_reserve_ch=", omap_dma_cmdline_reserve_ch);
 
 

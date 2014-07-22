@@ -34,6 +34,8 @@
 #include <linux/delay.h>
 #include <linux/usb/otg.h>
 #include <linux/i2c/twl4030.h>
+#include <linux/regulator/consumer.h>
+#include <linux/err.h>
 
 
 /* Register defines */
@@ -109,6 +111,9 @@
 #define CARKIT_PLS_CTRL_SPKRLEFT_BIASEN	(1 << 2)
 #define CARKIT_PLS_CTRL_RXPLSEN		(1 << 1)
 #define CARKIT_PLS_CTRL_TXPLSEN		(1 << 0)
+
+#define CARKIT_ANA_CTRL			0xBB
+#define SEL_MADC_MCPC			(1 << 3)
 
 #define MCPC_CTRL			0x30
 #define MCPC_CTRL_SET			0x31
@@ -215,6 +220,7 @@
 
 /* In module TWL4030_MODULE_PM_MASTER */
 #define PROTECT_KEY			0x0E
+#define STS_HW_CONDITIONS		0x0F
 
 /* In module TWL4030_MODULE_PM_RECEIVER */
 #define VUSB_DEDICATED1			0x7D
@@ -245,6 +251,11 @@ enum linkstat {
 struct twl4030_usb {
 	struct otg_transceiver	otg;
 	struct device		*dev;
+
+	/* TWL4030 internal USB regulator supplies */
+	struct regulator	*usb1v5;
+	struct regulator	*usb1v8;
+	struct regulator	*usb3v1;
 
 	/* for vbus reporting with irqs disabled */
 	spinlock_t		lock;
@@ -344,15 +355,26 @@ static enum linkstat twl4030_usb_linkstat(struct twl4030_usb *twl)
 	int	status;
 	int	linkstat = USB_LINK_UNKNOWN;
 
-	/* STS_HW_CONDITIONS */
-	status = twl4030_readb(twl, TWL4030_MODULE_PM_MASTER, 0x0f);
+	/*
+	 * For ID/VBUS sensing, see manual section 15.4.8 ...
+	 * except when using only battery backup power, two
+	 * comparators produce VBUS_PRES and ID_PRES signals,
+	 * which don't match docs elsewhere.  But ... BIT(7)
+	 * and BIT(2) of STS_HW_CONDITIONS, respectively, do
+	 * seem to match up.  If either is true the USB_PRES
+	 * signal is active, the OTG module is activated, and
+	 * its interrupt may be raised (may wake the system).
+	 */
+	status = twl4030_readb(twl, TWL4030_MODULE_PM_MASTER,
+			STS_HW_CONDITIONS);
 	if (status < 0)
 		dev_err(twl->dev, "USB link status err %d\n", status);
-	else if (status & BIT(7))
-		linkstat = USB_LINK_VBUS;
-	else if (status & BIT(2))
-		linkstat = USB_LINK_ID;
-	else
+	else if (status & (BIT(7) | BIT(2))) {
+		if (status & BIT(2))
+			linkstat = USB_LINK_ID;
+		else
+			linkstat = USB_LINK_VBUS;
+	} else
 		linkstat = USB_LINK_NONE;
 
 	dev_dbg(twl->dev, "HW_CONDITIONS 0x%02x/%d; link %d\n",
@@ -434,6 +456,18 @@ static void twl4030_phy_power(struct twl4030_usb *twl, int on)
 
 	pwr = twl4030_usb_read(twl, PHY_PWR_CTRL);
 	if (on) {
+		regulator_enable(twl->usb3v1);
+		regulator_enable(twl->usb1v8);
+		/*
+		 * Disabling usb3v1 regulator (= writing 0 to VUSB3V1_DEV_GRP
+		 * in twl4030) resets the VUSB_DEDICATED2 register. This reset
+		 * enables VUSB3V1_SLEEP bit that remaps usb3v1 ACTIVE state to
+		 * SLEEP. We work around this by clearing the bit after usv3v1
+		 * is re-activated. This ensures that VUSB3V1 is really active.
+		 */
+		twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0,
+							VUSB_DEDICATED2);
+		regulator_enable(twl->usb1v5);
 		pwr &= ~PHY_PWR_PHYPWD;
 		WARN_ON(twl4030_usb_write_verify(twl, PHY_PWR_CTRL, pwr) < 0);
 		twl4030_usb_write(twl, PHY_CLK_CTRL,
@@ -443,6 +477,9 @@ static void twl4030_phy_power(struct twl4030_usb *twl, int on)
 	} else  {
 		pwr |= PHY_PWR_PHYPWD;
 		WARN_ON(twl4030_usb_write_verify(twl, PHY_PWR_CTRL, pwr) < 0);
+		regulator_disable(twl->usb1v5);
+		regulator_disable(twl->usb1v8);
+		regulator_disable(twl->usb3v1);
 	}
 }
 
@@ -450,6 +487,9 @@ static void twl4030_phy_suspend(struct twl4030_usb *twl, int controller_off)
 {
 	if (twl->asleep)
 		return;
+
+	if (twl->otg.link_save_context)
+		twl->otg.link_save_context(&twl->otg);
 
 	twl4030_phy_power(twl, 0);
 	twl->asleep = 1;
@@ -466,9 +506,13 @@ static void twl4030_phy_resume(struct twl4030_usb *twl)
 	if (twl->usb_mode == T2_USB_MODE_ULPI)
 		twl4030_i2c_access(twl, 0);
 	twl->asleep = 0;
+
+	if (twl->otg.link_restore_context)
+		twl->otg.link_restore_context(&twl->otg);
+
 }
 
-static void twl4030_usb_ldo_init(struct twl4030_usb *twl)
+static int twl4030_usb_ldo_init(struct twl4030_usb *twl)
 {
 	/* Enable writing to power configuration registers */
 	twl4030_i2c_write_u8(TWL4030_MODULE_PM_MASTER, 0xC0, PROTECT_KEY);
@@ -480,20 +524,45 @@ static void twl4030_usb_ldo_init(struct twl4030_usb *twl)
 	/* input to VUSB3V1 LDO is from VBAT, not VBUS */
 	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0x14, VUSB_DEDICATED1);
 
-	/* turn on 3.1V regulator */
-	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0x20, VUSB3V1_DEV_GRP);
+	/* Initialize 3.1V regulator */
+	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0, VUSB3V1_DEV_GRP);
+
+	twl->usb3v1 = regulator_get(twl->dev, "usb3v1");
+	if (IS_ERR(twl->usb3v1))
+		return -ENODEV;
+
 	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0, VUSB3V1_TYPE);
 
-	/* turn on 1.5V regulator */
-	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0x20, VUSB1V5_DEV_GRP);
+	/* Initialize 1.5V regulator */
+	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0, VUSB1V5_DEV_GRP);
+
+	twl->usb1v5 = regulator_get(twl->dev, "usb1v5");
+	if (IS_ERR(twl->usb1v5))
+		goto fail1;
+
 	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0, VUSB1V5_TYPE);
 
-	/* turn on 1.8V regulator */
-	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0x20, VUSB1V8_DEV_GRP);
+	/* Initialize 1.8V regulator */
+	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0, VUSB1V8_DEV_GRP);
+
+	twl->usb1v8 = regulator_get(twl->dev, "usb1v8");
+	if (IS_ERR(twl->usb1v8))
+		goto fail2;
+
 	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0, VUSB1V8_TYPE);
 
 	/* disable access to power configuration registers */
 	twl4030_i2c_write_u8(TWL4030_MODULE_PM_MASTER, 0, PROTECT_KEY);
+
+	return 0;
+
+fail2:
+	regulator_put(twl->usb1v5);
+	twl->usb1v5 = NULL;
+fail1:
+	regulator_put(twl->usb3v1);
+	twl->usb3v1 = NULL;
+	return -ENODEV;
 }
 
 static ssize_t twl4030_usb_vbus_show(struct device *dev,
@@ -515,6 +584,7 @@ static DEVICE_ATTR(vbus, 0444, twl4030_usb_vbus_show, NULL);
 static irqreturn_t twl4030_usb_irq(int irq, void *_twl)
 {
 	struct twl4030_usb *twl = _twl;
+	struct otg_transceiver x = twl->otg;
 	int status;
 
 #ifdef CONFIG_LOCKDEP
@@ -539,12 +609,18 @@ static irqreturn_t twl4030_usb_irq(int irq, void *_twl)
 		 * USB_LINK_VBUS state.  musb_hdrc won't care until it
 		 * starts to handle softconnect right.
 		 */
-		twl4030charger_usb_en(status == USB_LINK_VBUS);
 
-		if (status == USB_LINK_NONE)
+		if (status == USB_LINK_NONE) {
+			if (x.link_force_active)
+				x.link_force_active(0);
 			twl4030_phy_suspend(twl, 0);
-		else
+		} else {
+			if (x.link_force_active)
+				x.link_force_active(1);
 			twl4030_phy_resume(twl);
+		}
+
+		twl4030charger_usb_en(status == USB_LINK_VBUS);
 	}
 	sysfs_notify(&twl->dev->kobj, NULL, "vbus");
 
@@ -598,7 +674,7 @@ static int __init twl4030_usb_probe(struct platform_device *pdev)
 {
 	struct twl4030_usb_data *pdata = pdev->dev.platform_data;
 	struct twl4030_usb	*twl;
-	int			status;
+	int			status, err;
 
 	if (!pdata) {
 		dev_dbg(&pdev->dev, "platform_data not available\n");
@@ -622,12 +698,31 @@ static int __init twl4030_usb_probe(struct platform_device *pdev)
 	/* init spinlock for workqueue */
 	spin_lock_init(&twl->lock);
 
-	twl4030_usb_ldo_init(twl);
+	err = twl4030_usb_ldo_init(twl);
+	if (err) {
+		dev_err(&pdev->dev, "ldo init failed\n");
+		kfree(twl);
+		return err;
+	}
 	otg_set_transceiver(&twl->otg);
 
 	platform_set_drvdata(pdev, twl);
 	if (device_create_file(&pdev->dev, &dev_attr_vbus))
 		dev_warn(&pdev->dev, "could not create sysfs file\n");
+
+	/*
+	 * One time configuration to route MCPC pins to the MADC for
+	 * monitoring */
+	regulator_enable(twl->usb3v1);
+	regulator_enable(twl->usb1v8);
+	twl4030_i2c_write_u8(TWL4030_MODULE_PM_RECEIVER, 0,
+			VUSB_DEDICATED2);
+	regulator_enable(twl->usb1v5);
+	twl4030_usb_write(twl, CARKIT_ANA_CTRL,
+		twl4030_usb_read(twl, CARKIT_ANA_CTRL) | SEL_MADC_MCPC);
+	regulator_disable(twl->usb1v5);
+	regulator_disable(twl->usb1v8);
+	regulator_disable(twl->usb3v1);
 
 	/* Our job is to use irqs and status from the power module
 	 * to keep the transceiver disabled when nothing's connected.
@@ -688,6 +783,9 @@ static int __exit twl4030_usb_remove(struct platform_device *pdev)
 	twl4030_usb_clear_bits(twl, POWER_CTRL, POWER_CTRL_OTG_ENAB);
 
 	twl4030_phy_power(twl, 0);
+	regulator_put(twl->usb1v5);
+	regulator_put(twl->usb1v8);
+	regulator_put(twl->usb3v1);
 
 	kfree(twl);
 
