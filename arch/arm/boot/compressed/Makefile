@@ -6,6 +6,7 @@
 
 HEAD	= head.o
 OBJS	= misc.o
+plus_sec := $(call as-instr,.arch_extension sec,+sec)
 FONTC	= $(srctree)/drivers/video/console/font_acorn_8x8.c
 
 #
